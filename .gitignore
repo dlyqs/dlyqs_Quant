@@ -1,0 +1,4 @@
+.idea/
+venv/
+.output/
+package-lock.json.lock
