@@ -1,4 +1,6 @@
 .idea/
-venv/
 .output/
-package-lock.json.lock
+/.venv/
+/~$guruList.xlsx
+/debug_akshare.py
+/package-lock.json
