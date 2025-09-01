@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS ref_list (
 CREATE TABLE IF NOT EXISTS stock_info (
   sec_code            VARCHAR(6) PRIMARY KEY,
   sec_name            VARCHAR(64) NOT NULL,
+  industry            VARCHAR(64),
   float_mktcap_100m   NUMERIC(20,2),
   updated_at          TIMESTAMP DEFAULT NOW()
 );
@@ -104,8 +105,30 @@ CREATE TABLE IF NOT EXISTS stock_post (
   PRIMARY KEY (sec_code, pick_date)
 );
 
+-- 用户关注指数热度表
+CREATE TABLE IF NOT EXISTS stock_heat (
+  sec_code  VARCHAR(6) NOT NULL,
+  pick_date DATE NOT NULL,
+  heat_m5 NUMERIC(10,2), heat_m4 NUMERIC(10,2), heat_m3 NUMERIC(10,2), 
+  heat_m2 NUMERIC(10,2), heat_m1 NUMERIC(10,2), heat_d0 NUMERIC(10,2),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (sec_code, pick_date)
+);
+
+-- 散户比例表
+CREATE TABLE IF NOT EXISTS stock_retail (
+  sec_code  VARCHAR(6) NOT NULL,
+  pick_date DATE NOT NULL,
+  retail_m5 NUMERIC(10,4), retail_m4 NUMERIC(10,4), retail_m3 NUMERIC(10,4),
+  retail_m2 NUMERIC(10,4), retail_m1 NUMERIC(10,4), retail_d0 NUMERIC(10,4),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (sec_code, pick_date)
+);
+
 CREATE INDEX IF NOT EXISTS idx_pre_date  ON stock_pre(pick_date);
 CREATE INDEX IF NOT EXISTS idx_post_date ON stock_post(pick_date);
+CREATE INDEX IF NOT EXISTS idx_heat_date ON stock_heat(pick_date);
+CREATE INDEX IF NOT EXISTS idx_retail_date ON stock_retail(pick_date);
 """
 
 def drop_all_tables():
@@ -118,7 +141,7 @@ def drop_all_tables():
 
 def truncate_all_data():
     with engine.begin() as conn:
-        for t in ["stock_pre","stock_post","stock_info","ref_list"]:
+        for t in ["stock_pre","stock_post","stock_info","ref_list","stock_heat","stock_retail"]:
             conn.execute(text(f"TRUNCATE TABLE {t} RESTART IDENTITY CASCADE;"))
     print("🧹 已清空所有表数据（保留结构）")
 
@@ -177,6 +200,67 @@ def build_ref_list(df_picks: pd.DataFrame) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+# ================== 获取热度/机构参与度/行业 ==================
+def fetch_heat_data(sec_code: str, max_retry: int = 3, sleep_sec: float = 0.6) -> pd.DataFrame:
+    """获取用户关注指数热度数据"""
+    last_err = None
+    for _ in range(max_retry):
+        try:
+            df = ak.stock_comment_detail_scrd_focus_em(symbol=sec_code)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = df.copy()
+                df.columns = ['trade_date', 'heat_value']
+                df['trade_date'] = pd.to_datetime(df['trade_date']).dt.date
+                return df.sort_values('trade_date')
+            return pd.DataFrame()
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_sec)
+    if last_err:
+        print(f"[{sec_code}] 获取热度数据失败：{last_err}")
+    return pd.DataFrame()
+
+def fetch_retail_data(sec_code: str, max_retry: int = 3, sleep_sec: float = 0.6) -> pd.DataFrame:
+    """获取机构参与度数据并计算散户比例"""
+    last_err = None
+    for _ in range(max_retry):
+        try:
+            df = ak.stock_comment_detail_zlkp_jgcyd_em(symbol=sec_code)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = df.copy()
+                df.columns = ['trade_date', 'institution_rate']
+                df['trade_date'] = pd.to_datetime(df['trade_date']).dt.date
+                # 计算散户比例 = 100 - 机构参与度
+                df['retail_rate'] = 100.0 - df['institution_rate']
+                return df.sort_values('trade_date')
+            return pd.DataFrame()
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_sec)
+    if last_err:
+        print(f"[{sec_code}] 获取机构参与度数据失败：{last_err}")
+    return pd.DataFrame()
+
+def fetch_industry_info(sec_code: str, max_retry: int = 3, sleep_sec: float = 0.6) -> str | None:
+    """获取行业信息"""
+    last_err = None
+    for _ in range(max_retry):
+        try:
+            df = ak.stock_individual_info_em(sec_code)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                item_col, val_col = df.columns[:2]
+                row = df[df[item_col].astype(str).str.contains("行业", na=False)]
+                if not row.empty:
+                    industry = str(row.iloc[0, 1]).strip()
+                    return industry if industry and industry != "None" else None
+            return None
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_sec)
+    if last_err:
+        print(f"[{sec_code}] 获取行业信息失败：{last_err}")
+    return None
+
 # ================== 名称/市值（带重试） ==================
 def fetch_name_mktcap(sym: str, max_retry: int = 3, sleep_sec: float = 0.6):
     last_err = None
@@ -201,24 +285,26 @@ def fetch_name_mktcap(sym: str, max_retry: int = 3, sleep_sec: float = 0.6):
         print(f"[{sym}] 获取名称/市值失败：{last_err}")
     return None, None
 
-def upsert_stock_info(sec_code: str, sec_name: str | None, cap100m: float | None):
+def upsert_stock_info(sec_code: str, sec_name: str | None, cap100m: float | None, industry: str | None = None):
     with engine.begin() as conn:
         conn.execute(text("""
-            INSERT INTO stock_info (sec_code, sec_name, float_mktcap_100m)
-            VALUES (:sec, :name, :cap)
+            INSERT INTO stock_info (sec_code, sec_name, industry, float_mktcap_100m)
+            VALUES (:sec, :name, :industry, :cap)
             ON CONFLICT (sec_code) DO UPDATE
             SET sec_name = COALESCE(EXCLUDED.sec_name, stock_info.sec_name),
+                industry = COALESCE(EXCLUDED.industry, stock_info.industry),
                 float_mktcap_100m = COALESCE(EXCLUDED.float_mktcap_100m, stock_info.float_mktcap_100m),
                 updated_at = NOW();
-        """), {'sec': sec_code, 'name': (sec_name or ''), 'cap': cap100m})
+        """), {'sec': sec_code, 'name': (sec_name or ''), 'industry': industry, 'cap': cap100m})
 
 def fill_names_and_mktcap(ref_df: pd.DataFrame) -> pd.DataFrame:
-    names, caps = [], []
-    print("📊 正在获取股票名称和市值...")
+    names, caps, industries = [], [], []
+    print("📊 正在获取股票名称、市值和行业信息...")
     for sec in tqdm(ref_df['sec_code'], desc="获取股票信息", unit="只"):
         name, cap = fetch_name_mktcap(sec)  # 传 6位数字即可
-        names.append(name); caps.append(cap)
-        upsert_stock_info(sec, name, cap)
+        industry = fetch_industry_info(sec)  # 获取行业信息
+        names.append(name); caps.append(cap); industries.append(industry)
+        upsert_stock_info(sec, name, cap, industry)
     ref_df = ref_df.copy()
     ref_df['sec_name'] = names
     return ref_df
@@ -375,7 +461,32 @@ def pick_by_trade_offset(hist: pd.DataFrame, t: dt.date, delta: int):
         float(r.get('amount'))  if pd.notna(r.get('amount'))  else None,
     )
 
-# ================== 写入：stock_pre / stock_post ==================
+def pick_by_date_offset(data_df: pd.DataFrame, target_date: dt.date, delta: int, value_col: str):
+    """
+    从时间序列数据中获取目标日期偏移delta天的值
+    """
+    if data_df is None or data_df.empty:
+        return None
+    
+    dates = data_df["trade_date"].tolist()
+    # 找到 <= target_date 的最近一个交易日下标
+    i = None
+    for k in range(len(dates)-1, -1, -1):
+        if dates[k] <= target_date:
+            i = k
+            break
+    if i is None:
+        return None
+    
+    j = i + delta
+    if j < 0 or j >= len(dates):
+        return None
+    
+    r = data_df.iloc[j]
+    val = r.get(value_col)
+    return float(val) if pd.notna(val) else None
+
+# ================== 写入：stock_pre / stock_post / stock_heat / stock_retail ==================
 def upsert_pre_row(conn, sec: str, t: dt.date, hist: pd.DataFrame):
     payload = {'sec': sec, 't': t}
     for suf, delta in [('m3',-3),('m2',-2),('m1',-1),('d0',0)]:
@@ -442,6 +553,46 @@ def upsert_post_row(conn, sec: str, t: dt.date, hist: pd.DataFrame):
           updated_at = NOW();
     """), payload)
 
+def upsert_heat_row(conn, sec: str, t: dt.date, heat_df: pd.DataFrame):
+    """写入热度数据：入选日当天和前5日"""
+    payload = {'sec': sec, 't': t}
+    for k in range(-5, 1):  # m5, m4, m3, m2, m1, d0
+        suf = f"m{abs(k)}" if k < 0 else "d0"
+        heat_val = pick_by_date_offset(heat_df, t, k, 'heat_value')
+        payload[f"heat_{suf}"] = heat_val
+    
+    conn.execute(text("""
+        INSERT INTO stock_heat (
+          sec_code, pick_date, heat_m5, heat_m4, heat_m3, heat_m2, heat_m1, heat_d0
+        ) VALUES (
+          :sec, :t, :heat_m5, :heat_m4, :heat_m3, :heat_m2, :heat_m1, :heat_d0
+        )
+        ON CONFLICT (sec_code, pick_date) DO UPDATE SET
+          heat_m5=EXCLUDED.heat_m5, heat_m4=EXCLUDED.heat_m4, heat_m3=EXCLUDED.heat_m3,
+          heat_m2=EXCLUDED.heat_m2, heat_m1=EXCLUDED.heat_m1, heat_d0=EXCLUDED.heat_d0,
+          updated_at = NOW();
+    """), payload)
+
+def upsert_retail_row(conn, sec: str, t: dt.date, retail_df: pd.DataFrame):
+    """写入散户比例数据：入选日当天和前5日"""
+    payload = {'sec': sec, 't': t}
+    for k in range(-5, 1):  # m5, m4, m3, m2, m1, d0
+        suf = f"m{abs(k)}" if k < 0 else "d0"
+        retail_val = pick_by_date_offset(retail_df, t, k, 'retail_rate')
+        payload[f"retail_{suf}"] = retail_val
+    
+    conn.execute(text("""
+        INSERT INTO stock_retail (
+          sec_code, pick_date, retail_m5, retail_m4, retail_m3, retail_m2, retail_m1, retail_d0
+        ) VALUES (
+          :sec, :t, :retail_m5, :retail_m4, :retail_m3, :retail_m2, :retail_m1, :retail_d0
+        )
+        ON CONFLICT (sec_code, pick_date) DO UPDATE SET
+          retail_m5=EXCLUDED.retail_m5, retail_m4=EXCLUDED.retail_m4, retail_m3=EXCLUDED.retail_m3,
+          retail_m2=EXCLUDED.retail_m2, retail_m1=EXCLUDED.retail_m1, retail_d0=EXCLUDED.retail_d0,
+          updated_at = NOW();
+    """), payload)
+
 def fill_windows_for(ref_df: pd.DataFrame, mode: str):
     """
     仅对"每段首日 pick_date"写入 stock_pre/stock_post。
@@ -464,7 +615,10 @@ def fill_windows_for(ref_df: pd.DataFrame, mode: str):
         with engine.begin() as conn:
             exist_pre = pd.read_sql(text("SELECT sec_code, pick_date FROM stock_pre"), conn)
             exist_post= pd.read_sql(text("SELECT sec_code, pick_date FROM stock_post"), conn)
-        existed = set(map(tuple, exist_pre.values.tolist())) | set(map(tuple, exist_post.values.tolist()))
+            exist_heat = pd.read_sql(text("SELECT sec_code, pick_date FROM stock_heat"), conn)
+            exist_retail = pd.read_sql(text("SELECT sec_code, pick_date FROM stock_retail"), conn)
+        existed = set(map(tuple, exist_pre.values.tolist())) | set(map(tuple, exist_post.values.tolist())) | \
+                 set(map(tuple, exist_heat.values.tolist())) | set(map(tuple, exist_retail.values.tolist()))
         targets = [x for x in targets if x not in existed]
         print(f"➕ 追加模式：需要新增窗口 {len(targets)} 行")
 
@@ -486,7 +640,16 @@ def fill_windows_for(ref_df: pd.DataFrame, mode: str):
         for sec, span in tqdm(groups.items(), desc="处理股票历史数据", unit="只"):
             start = span['min'] - dt.timedelta(days=40)
             end   = span['max'] + dt.timedelta(days=40)
+            
+            # 获取历史行情数据
             hist = fetch_hist_df(sec, start, end)
+            
+            # 获取热度数据
+            heat_df = fetch_heat_data(sec)
+            
+            # 获取散户比例数据
+            retail_df = fetch_retail_data(sec)
+            
             if hist.empty:
                 tqdm.write(f"[{sec}] 无历史数据，跳过")
                 continue
@@ -496,8 +659,10 @@ def fill_windows_for(ref_df: pd.DataFrame, mode: str):
             for (s, t) in target_dates:
                 upsert_pre_row(conn, sec, t, hist)
                 upsert_post_row(conn, sec, t, hist)
+                upsert_heat_row(conn, sec, t, heat_df)
+                upsert_retail_row(conn, sec, t, retail_df)
 
-    print("✅ 已写入 stock_pre / stock_post")
+    print("✅ 已写入 stock_pre / stock_post / stock_heat / stock_retail")
 
 # ================== 运行后校验 & 名称补齐 ==================
 def validate_and_retry(ref_df: pd.DataFrame):
@@ -525,6 +690,21 @@ def validate_and_retry(ref_df: pd.DataFrame):
     with engine.begin() as conn:
         left = conn.execute(text("SELECT COUNT(*) FROM ref_list WHERE sec_name IS NULL OR sec_name=''")).scalar()
     print(f"🔎 名称补齐后剩余空值：{left} 条")
+    
+    # 补齐行业信息
+    with engine.begin() as conn:
+        df_missing_industry = pd.read_sql(text("SELECT sec_code FROM stock_info WHERE industry IS NULL OR industry=''"), conn)
+    if not df_missing_industry.empty:
+        print(f"🔁 B表行业列：发现 {len(df_missing_industry)} 条为空，重试回填……")
+        with engine.begin() as conn:
+            update_industry = text("UPDATE stock_info SET industry=:industry, updated_at=NOW() WHERE sec_code=:sec;")
+            for sec in tqdm(df_missing_industry['sec_code'].tolist(), desc="补齐行业信息", unit="只"):
+                industry = fetch_industry_info(sec, max_retry=4, sleep_sec=0.8)
+                if industry:
+                    conn.execute(update_industry, {'sec': sec, 'industry': industry})
+    else:
+        print("🔎 B表行业列：无空数据 ✅")
+
 
 # ================== 主流程 ==================
 def main():
@@ -575,10 +755,14 @@ def main():
         n_b = conn.execute(text("SELECT COUNT(*) FROM stock_info")).scalar()
         n_pre = conn.execute(text("SELECT COUNT(*) FROM stock_pre")).scalar()
         n_post= conn.execute(text("SELECT COUNT(*) FROM stock_post")).scalar()
+        n_heat = conn.execute(text("SELECT COUNT(*) FROM stock_heat")).scalar()
+        n_retail = conn.execute(text("SELECT COUNT(*) FROM stock_retail")).scalar()
     print(f"📦 A表(ref_list): {n_a} 只股票")
     print(f"📦 B表(stock_info): {n_b} 条记录")
     print(f"📦 PRE表(特征数据): {n_pre} 行")
     print(f"📦 POST表(后续数据): {n_post} 行")
+    print(f"📦 HEAT表(热度数据): {n_heat} 行")
+    print(f"📦 RETAIL表(散户比例): {n_retail} 行")
     print("🎉 全部完成！")
 
 if __name__ == "__main__":
